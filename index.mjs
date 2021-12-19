@@ -2,17 +2,25 @@ import { readFileSync } from 'fs';
 import Promise from 'bluebird';
 import _ from 'lodash'; // Lazy, lodash isn't really needed anymore
 import debug from 'debug';
-import { JobQueue } from '@oada/oada-jobs';
+import { Service } from '@oada/jobs';
 import tsig from '@trellisfw/signatures';
+import equal from 'deep-equal';
 
-import config from './config.js'
+import config from './config.js';
+import libConfig from './lib/lib-config.cjs';
+import defaultConfig from './config.defaults.js';
 
 const error = debug('trellis-signer:error');
 const warn = debug('trellis-signer:warn');
 const info = debug('trellis-signer:info');
 const trace = debug('trellis-signer:trace');
 
+//----------------------------------------------------------------------------------------
+// Load configs (keys, signer name, type)
+//----------------------------------------------------------------------------------------
+
 // You can generate a signing key pair by running `oada-certs --create-keys`
+const config = libConfig(defaultConfig);
 const prvKey = JSON.parse(readFileSync(config.get('privateJWK')));
 const pubKey = tsig.keys.pubFromPriv(prvKey);
 const header = { jwk: pubKey };
@@ -26,79 +34,86 @@ const TOKEN = config.get('token');
 let DOMAIN = config.get('domain') || '';
 if (!DOMAIN.match(/^http/)) DOMAIN = 'https://'+DOMAIN;
 
-const service = new JobQueue('trellis-signer', doSigning, {
-  concurrency: 1,
-  domain: DOMAIN,
-  token: TOKEN
-});
 
-async function doSigning(id, task, con) {
-  let vdoc = false;
+//----------------------------------------------------------------------------------------
+// Utility function: determines if any of the signatures on this document are already from
+// this signer and of this type
+//----------------------------------------------------------------------------------------
+async function alreadyHasSignature(res) {
+  // If there is no signatures key, there is no existing signature so go ahead and sign it
+  if (!res.signatures) {
+    return false;
+  }
   try {
-    vdoc = await con.get({ path: `/resources/${id}` }).then(r => r.data);
+    const { trusted, valid, unchanged, payload, original, details } = await tsig.verify(res);
+
+    trace(`Checked for signature, got back trusted ${trusted} valid ${valid} unchanged ${unchanged} payload ${payload}`);
+    // If already signed by us, return true
+    if (payload && payload.type === type && equal(payload.signer, signer)) return true;
+
+    // If not already signed by us, check if there are more signatures:
+    if (original) return alreadyHasSignature(original);
+
+    // If there are no more signatures, and we haven't already signed it, then we can now say it wasn't signed by us.
+    return false;
   } catch (e) {
-    error(`Could not get /resources/${id}, err = %O`, e);
-    throw new Error('Could not find audits');
+    return false; // tsig.verify threw an exception, so we definitely have not signed it.
   }
-  let resourceIdsToSign = [];
-  if (vdoc.audits) {
-    resourceIdsToSign = resourceIdsToSign.concat(_.map(vdoc.audits, link => link._id));
-  }
-  if (vdoc.cois) {
-    resourceIdsToSign = resourceIdsToSign.concat(_.map(vdoc.cois, link => link._id));
-  }
-  // resourceIdsToSign = [ 'resources/123kl', 'resources/02infko2f' ]
+}
 
-  return Promise.each(resourceIdsToSign, async (signid) => {
-    info(`Processing item ${signid} for res ${id}`);
-    const r = await con.get({ path: `/${signid}` });
-    let a = _.cloneDeep(r.data); // the actual audit or coi json
 
-    try {
+//----------------------------------------------------------------------------------------
+// Main Service definition: will watch /bookmarks/trellisfw/trellis-signer/jobs for
+// "sign" jobs to run.
+//----------------------------------------------------------------------------------------
 
-      // Test first if this thing already has a transcription signature.  If so, skip it.
-      trace('Checking for existing '+type+' signature...');
-      async function hasTranscriptionSignature(res) {
-        if (!res.signatures) return false;
-        const { trusted, valid, unchanged, payload, original, details } = await tsig.verify(res);
-	trace(`Checked for signature, got back trusted ${trusted} valid ${valid} unchanged ${unchanged} payload ${payload}`);
-	if (payload && payload.type === type) return true; // Found one!
-        if (original) return hasTranscriptionSignature(original);
-        return false; // shouldn't ever get here.
-      }
-      if (await hasTranscriptionSignature(a)) {
-        warn(`Item ${signid} already has a transcription signature on it, choose to skip it and not apply a new one`);
-	return { success: true };
-      }
-      trace('Did not find existing '+type+' signature, signing...');
+// Create service with up to 10 "in-flight" simultaneous requests to OADA
+const service = new Service('trellis-signer', DOMAIN, TOKEN, 10);
 
-      // Otherwise, go ahead and apply the signature
-      a = await tsig.sign(a, prvKey, { header, signer, type });
-    } catch (e) {
-      error(`Could not apply signature to resource ${signid}, err = %O`, e);
-      throw new Error(`Could not apply signature to resource ${signid}`);
-    }
+services.on('sign', 10*1000,  async (job, { jobId, log, oada }) => {
+  const path = job?.config?.path;
+  if (!path) throw new Error(`FAIL job ${jobId}: job.config.path was not truthy`);
 
-    info(`PUTing signed signatures key only to /${signid}/signatures`);
-    try {
-      await con.put({
-        path: `/${signid}/signatures`,
-        data: a.signatures,
-        headers: { 'Content-Type': a._type },
-      });
-    } catch (e) {
-      error(`Failed to apply signature to /${signid}/signatures, error = `, e);
-      throw new Error(
-        `Failed to apply signature to /${signid}/signatures`
-      );
-    }
+  // Grab the original doc for signing specified in the job config:
+  const orig = await oada.get({ path }).then(r => r.data)
+  .catch(e => {
+    error(`FAIL job ${jobId}: Could not get path ${path}, err = %O`, e);
+    throw new Error(`FAIL job ${jobId}: Could not get path ${path}`);
   });
+
+  // Test first if this thing already has a transcription signature.  If so, skip it.
+  trace('Checking for existing '+type+' signature...');
+  if (await alreadyHasSignature(orig)) {
+    warn(`Document at path ${path} already has a ${type} signature on it from us, choose to skip it and not apply a new one`);
+    return { success: true };
+  }
+  trace('Did not find existing '+type+' signature, signing...');
+
+  // Apply the signature:
+  const signed = await tsig.sign(orig, prvKey, { header, signer, type })
+  .catch (e => {
+    error(`Could not apply signature to ${path}, err = %O`, e);
+    throw new Error(`Could not apply signature to path ${path}`);
+  });
+
+  // Put the signature back (leave rest of document alone):
+  info(`PUTing signed signatures key only to /${path}/signatures`);
+  await oada.put({
+    path: `${path}/signatures`,
+    data: signed.signatures,
+  }).catch(e => {
+    error(`Failed to PUT signature to ${path}/signatures, error = `, e);
+    throw new Error(`Failed to PUT signature to ${path}/signatures`);
+  });
+
+  // We are done with the job!  Document is signed.
+  return { success: true };
 }
 
 (async () => {
   try {
     await service.start();
   } catch (e) {
-    console.error(e);
+    error(e);
   }
 })();
