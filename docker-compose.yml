@@ -1,15 +1,23 @@
-version: '3'
-
 services:
-  trellis-signer:
-    build: .
-    container_name: trellis-signer
-    restart: always
+  service:
+    build:
+      context: .
+    image: trellisfw/trellis-signer
+    restart: unless-stopped
+    # Map your private key file to /private_key.jwk in the container for signing
     volumes:
-      - ./trellis-signer:/code/trellis-signer
+      ./keys/private_key.jwk:/private_key.jwk
     environment:
       - NODE_TLS_REJECT_UNAUTHORIZED
       - NODE_ENV=${NODE_ENV:-development}
-      - DEBUG=${DEBUG:-"trellis-signer:info,*warn*,*error*"}
-      - domain
-      - token
+      - DEBUG=${DEBUG-*:error,*:warn,*:info}
+      # Connect to host if DOMAIN not set.
+      # You should really not rely on this though. Set DOMAIN.
+      - DOMAIN=${DOMAIN:-host.docker.internal}
+      # TODO: Nicer way to deal with tokens?
+      - TOKEN=${TOKEN:-god}
+      # Make this the same as where you mapped it into the container above
+      - PRIVATEJWK=${PRIVATEJWK:-/private_key.jwk}
+      - SIGNERNAME
+      - SIGNERURL
+      - SIGNATURETYPE
